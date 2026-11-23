@@ -1,69 +1,118 @@
+// OpenGL viewer for the physics engine.
+//
+//   Left mouse drag  orbit camera        Scroll   zoom
+//   B  drop a box    N  drop a sphere    S  shoot a sphere from the camera
+//   C  toggle contact points             Space  pause     R  reset scene     Esc  quit
+#include <GLFW/glfw3.h>
+
+#include <chrono>
 #include <cstdio>
 #include <random>
-#include <vector>
-#include <windows.h>
 
-#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
-#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
-#endif
+#include "Pipeline/World.h"
+#include "Render/Renderer.h"
 
-const int   COLS = 80, ROWS = 24;      // size of the text "screen"
-const float W = 80.f, H = 24.f;        // world size
-const float GRAVITY = 30.f;            // downward acceleration
-const float RESTITUTION = 0.8f;        // fraction of speed kept after a bounce
-const float DRAG = 0.05f;              // air resistance
-const float DT = 1.f / 120.f;          // physics time step
+using namespace eng;
 
-struct Particle { float x, y, vx, vy; };
+static std::mt19937 rng(2024);
 
-void step(std::vector<Particle>& ps, float dt) {
-    for (auto& p : ps) {
-        // update velocity first, then position
-        p.vx += (-DRAG * p.vx) * dt;
-        p.vy += (GRAVITY - DRAG * p.vy) * dt;
-        p.x += p.vx * dt;
-        p.y += p.vy * dt;
-        // bounce off the walls
-        if (p.x < 0)     { p.x = 0;     p.vx = -p.vx * RESTITUTION; }
-        if (p.x > W - 1) { p.x = W - 1; p.vx = -p.vx * RESTITUTION; }
-        if (p.y < 0)     { p.y = 0;     p.vy = -p.vy * RESTITUTION; }
-        if (p.y > H - 1) { p.y = H - 1; p.vy = -p.vy * RESTITUTION; }
+static float rnd(float lo, float hi) {
+    return std::uniform_real_distribution<float>(lo, hi)(rng);
+}
+
+static void buildScene(World& w) {
+    w.clear();
+    w.addPlane(Vec3(0, 1, 0), 0.f);
+
+    // A wall of boxes to knock over.
+    for (int y = 0; y < 6; y++)
+        for (int x = 0; x < 6; x++) {
+            float off = (y % 2) ? 0.5f : 0.f;
+            w.addBox(Vec3(-3.f + x * 1.02f + off, 0.5f + y * 1.0f, -4.f), Vec3(0.5f, 0.5f, 0.5f), 1.f);
+        }
+
+    // A short pyramid.
+    for (int level = 0; level < 4; level++)
+        for (int i = 0; i < 4 - level; i++)
+            w.addBox(Vec3(4.f + (i - (3 - level) * 0.5f) * 1.02f, 0.5f + level, 2.f), Vec3(0.5f, 0.5f, 0.5f), 1.f);
+
+    // A couple of balls to start the action.
+    for (int i = 0; i < 4; i++) {
+        int s = w.addSphere(Vec3(rnd(-2, 2), 8.f + i * 1.5f, rnd(-1, 1)), 0.5f, 1.f);
+        w.body(s).restitution = 0.5f;
     }
 }
 
-void draw(const std::vector<Particle>& ps, double t) {
-    char grid[ROWS][COLS + 1];
-    for (int r = 0; r < ROWS; r++) {
-        for (int c = 0; c < COLS; c++) grid[r][c] = ' ';
-        grid[r][COLS] = '\0';
+static void spawn(World& w, bool box, const Vec3& pos, const Vec3& vel) {
+    int i;
+    if (box) {
+        i = w.addBox(pos, Vec3(rnd(0.3f, 0.7f), rnd(0.3f, 0.7f), rnd(0.3f, 0.7f)), 1.f);
+        w.body(i).orientation = Quat::fromAxisAngle(Vec3(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1)), rnd(0, 6.28f)).normalized();
+        w.body(i).updateDerived();
+    } else {
+        i = w.addSphere(pos, rnd(0.3f, 0.6f), 1.f);
+        w.body(i).restitution = 0.5f;
     }
-    for (auto& p : ps) grid[(int)p.y][(int)p.x] = 'o';
-
-    std::printf("\033[H");   // move cursor to top-left (no flicker)
-    for (int r = 0; r < ROWS; r++) std::printf("%s\n", grid[r]);
-    std::printf("t=%.2fs  particles=%d   (Ctrl+C to quit)\n", t, (int)ps.size());
-    std::fflush(stdout);
+    w.body(i).linearVelocity = vel;
 }
 
 int main() {
-    // turn on ANSI escape codes in the Windows console
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD mode = 0;
-    GetConsoleMode(h, &mode);
-    SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-
-    std::mt19937 rng(12345);
-    std::uniform_real_distribution<float> rx(-15.f, 15.f), ry(-25.f, 0.f);
-
-    std::vector<Particle> ps;
-    for (int i = 0; i < 40; i++)
-        ps.push_back({W / 2, H / 2, rx(rng), ry(rng)});
-
-    std::printf("\033[2J");   // clear the screen once
-    double t = 0;
-    while (true) {
-        for (int i = 0; i < 2; i++) { step(ps, DT); t += DT; }
-        draw(ps, t);
-        Sleep(16);
+    Renderer renderer;
+    if (!renderer.init(1280, 720, "3D Physics Engine")) {
+        std::fprintf(stderr, "Could not create an OpenGL window.\n");
+        return 1;
     }
+
+    WorldSettings settings;
+    settings.threads = 2;
+    World world(settings);
+    buildScene(world);
+
+    const float dt = 1.f / 120.f;
+    double accumulator = 0.0;
+    bool paused = false, showContacts = false;
+    auto last = std::chrono::steady_clock::now();
+    double fpsTimer = 0.0;
+    int frames = 0;
+
+    while (!renderer.shouldClose()) {
+        renderer.pollEvents();
+        if (renderer.keyDown(GLFW_KEY_ESCAPE)) break;
+        if (renderer.keyPressedOnce(GLFW_KEY_SPACE)) paused = !paused;
+        if (renderer.keyPressedOnce(GLFW_KEY_C)) showContacts = !showContacts;
+        if (renderer.keyPressedOnce(GLFW_KEY_R)) buildScene(world);
+        if (renderer.keyPressedOnce(GLFW_KEY_B)) spawn(world, true, Vec3(rnd(-3, 3), 12.f, rnd(-3, 3)), Vec3());
+        if (renderer.keyPressedOnce(GLFW_KEY_N)) spawn(world, false, Vec3(rnd(-3, 3), 12.f, rnd(-3, 3)), Vec3());
+        if (renderer.keyPressedOnce(GLFW_KEY_S))
+            spawn(world, false, renderer.cameraPosition() + renderer.cameraForward() * 2.f, renderer.cameraForward() * 25.f);
+
+        auto now = std::chrono::steady_clock::now();
+        double frame = std::chrono::duration<double>(now - last).count();
+        last = now;
+        if (frame > 0.1) frame = 0.1;  // avoid a spiral of death after a stall
+
+        if (!paused) {
+            accumulator += frame;
+            while (accumulator >= dt) {
+                world.step(dt);
+                accumulator -= dt;
+            }
+        }
+
+        renderer.draw(world, showContacts);
+
+        fpsTimer += frame;
+        frames++;
+        if (fpsTimer >= 0.5) {
+            char title[160];
+            std::snprintf(title, sizeof(title), "3D Physics Engine | %d bodies | %d contacts | %.0f fps%s",
+                          world.bodyCount(), (int)world.manifolds().size(), frames / fpsTimer, paused ? " | PAUSED" : "");
+            renderer.setTitle(title);
+            fpsTimer = 0.0;
+            frames = 0;
+        }
+    }
+
+    renderer.shutdown();
+    return 0;
 }
